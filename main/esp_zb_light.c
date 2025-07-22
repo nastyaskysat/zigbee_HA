@@ -1,57 +1,135 @@
 #include "driver/gpio.h"
+#include "driver/uart.h"
 #include "esp_zb_light.h"
 #include "esp_check.h"
 #include "esp_log.h"
 #include "nvs_flash.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/queue.h"
 #include "ha/esp_zigbee_ha_standard.h"
+#include "string.h"
 
 #if !defined ZB_ED_ROLE
 #error Define ZB_ED_ROLE in idf.py menuconfig to compile light (End Device) source code.
 #endif
 
-static const char *TAG = "ESP_ZB_GPIO_SWITCH";
+static const char *TAG = "ESP_ZB_USB_UART";
 #define ESP_MANUFACTURER_NAME "ESP_CUSTOM"
 #define ESP_MODEL_IDENTIFIER "ESP_LIGHT"
-#define GPIO_OUTPUT_PIN_1 3  // GPIO для первого эндпоинта
-#define GPIO_OUTPUT_PIN_2 4  // GPIO для второго эндпоинта
 
-// Объявление функций
-static esp_err_t gpio_driver_init(void);
-static void gpio_driver_set_state(uint8_t endpoint, bool state);
+// UART configuration for USB-to-UART
+#define UART_PORT_NUM      UART_NUM_0  // USB CDC port
+#define UART_BAUD_RATE     115200
+#define UART_BUF_SIZE      256
+#define UART_QUEUE_SIZE    20
+
+// Protocol definition
+#define CMD_PREFIX        "CMD:"
+#define CMD_ON_TEMPLATE   "CMD:EP%d:ON"
+#define CMD_OFF_TEMPLATE  "CMD:EP%d:OFF"
+#define CMD_END           "\r\n"
+
+// Global variables
+static QueueHandle_t uart_queue;
+
+// Function declarations
+static esp_err_t uart_driver_init(void);
+static void send_command_to_wirenboard(uint8_t endpoint, bool state);
+static void uart_event_task(void *pvParameters);
 static void bdb_start_top_level_commissioning_cb(uint8_t mode_mask);
 static esp_err_t zb_attribute_handler(const esp_zb_zcl_set_attr_value_message_t *message);
 static esp_err_t zb_action_handler(esp_zb_core_action_callback_id_t callback_id, const void *message);
 static void esp_zb_task(void *pvParameters);
 
-// Инициализация GPIO
-static esp_err_t gpio_driver_init(void)
+// UART initialization
+static esp_err_t uart_driver_init(void)
 {
-    gpio_config_t io_conf = {
-        .pin_bit_mask = (1ULL << GPIO_OUTPUT_PIN_1) | (1ULL << GPIO_OUTPUT_PIN_2),
-        .mode = GPIO_MODE_OUTPUT,
-        .pull_up_en = GPIO_PULLUP_DISABLE,
-        .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type = GPIO_INTR_DISABLE,
+    uart_config_t uart_config = {
+        .baud_rate = UART_BAUD_RATE,
+        .data_bits = UART_DATA_8_BITS,
+        .parity = UART_PARITY_DISABLE,
+        .stop_bits = UART_STOP_BITS_1,
+        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
+        .source_clk = UART_SCLK_DEFAULT,
     };
-    esp_err_t ret = gpio_config(&io_conf);
+    
+    // Install UART driver with event queue
+    esp_err_t ret = uart_driver_install(UART_PORT_NUM, 
+                                      UART_BUF_SIZE * 2,
+                                      UART_BUF_SIZE * 2,
+                                      UART_QUEUE_SIZE,
+                                      &uart_queue,
+                                      0);
     if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "GPIO config failed");
+        ESP_LOGE(TAG, "UART driver install failed");
         return ret;
     }
-    gpio_set_level(GPIO_OUTPUT_PIN_1, false);
-    gpio_set_level(GPIO_OUTPUT_PIN_2, false);
-    ESP_LOGI(TAG, "GPIOs initialized");
+    
+    ret = uart_param_config(UART_PORT_NUM, &uart_config);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "UART param config failed");
+        return ret;
+    }
+    
+    // No need to set pins for USB-to-UART
+    ESP_LOGI(TAG, "USB-to-UART initialized");
     return ESP_OK;
 }
 
-// Установка состояния GPIO для конкретного эндпоинта
-static void gpio_driver_set_state(uint8_t endpoint, bool state)
+// UART event handler task
+static void uart_event_task(void *pvParameters)
 {
-    gpio_num_t pin = (endpoint == HA_ESP_LIGHT_ENDPOINT) ? GPIO_OUTPUT_PIN_1 : GPIO_OUTPUT_PIN_2;
-    gpio_set_level(pin, state);
-    ESP_LOGI(TAG, "GPIO %d (endpoint %d) set to %s", pin, endpoint, state ? "ON" : "OFF");
+    uart_event_t event;
+    uint8_t rx_buf[UART_BUF_SIZE];
+    
+    for (;;) {
+        if (xQueueReceive(uart_queue, (void *)&event, portMAX_DELAY)) {
+            switch (event.type) {
+                case UART_DATA:
+                    // Read data from UART
+                    int len = uart_read_bytes(UART_PORT_NUM, rx_buf, event.size, portMAX_DELAY);
+                    if (len > 0) {
+                        rx_buf[len] = '\0'; // Null-terminate
+                        ESP_LOGI(TAG, "Received from Wirenboard: %s", rx_buf);
+                    }
+                    break;
+                    
+                case UART_FIFO_OVF:
+                case UART_BUFFER_FULL:
+                    ESP_LOGW(TAG, "UART buffer overflow");
+                    uart_flush_input(UART_PORT_NUM);
+                    break;
+                    
+                default:
+                    break;
+            }
+        }
+    }
+    vTaskDelete(NULL);
+}
+
+// Send command to Wirenboard
+static void send_command_to_wirenboard(uint8_t endpoint, bool state)
+{
+    char command[32];
+    
+    if (state) {
+        snprintf(command, sizeof(command), CMD_ON_TEMPLATE, endpoint);
+    } else {
+        snprintf(command, sizeof(command), CMD_OFF_TEMPLATE, endpoint);
+    }
+    
+    strcat(command, CMD_END);
+    
+    int len = strlen(command);
+    int sent = uart_write_bytes(UART_PORT_NUM, command, len);
+    
+    if (sent == len) {
+        ESP_LOGI(TAG, "Sent command to Wirenboard: %s", command);
+    } else {
+        ESP_LOGE(TAG, "Failed to send command to Wirenboard, sent %d/%d bytes", sent, len);
+    }
 }
 
 // Callback для запуска комиссинга
@@ -75,7 +153,7 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
     case ESP_ZB_BDB_SIGNAL_DEVICE_FIRST_START:
     case ESP_ZB_BDB_SIGNAL_DEVICE_REBOOT:
         if (err_status == ESP_OK) {
-            ESP_LOGI(TAG, "Deferred driver init: %s", gpio_driver_init() ? "failed" : "success"); // Убрал false из вызова
+            ESP_LOGI(TAG, "Deferred driver init: %s", uart_driver_init() ? "failed" : "success");
             ESP_LOGI(TAG, "Device started up in %s factory-reset mode", 
                    esp_zb_bdb_is_factory_new() ? "" : "non");
             if (esp_zb_bdb_is_factory_new()) {
@@ -113,15 +191,16 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
         break;
     }
 }
+
 // Обработчик атрибутов Zigbee
 static esp_err_t zb_attribute_handler(const esp_zb_zcl_set_attr_value_message_t *message)
 {
-    if ((message->info.dst_endpoint == HA_ESP_LIGHT_ENDPOINT || 
-         message->info.dst_endpoint == HA_ESP_LIGHT_ENDPOINT + 1) &&
+    if ((message->info.dst_endpoint >= HA_ESP_LIGHT_ENDPOINT && 
+         message->info.dst_endpoint <= HA_ESP_LIGHT_ENDPOINT + 1) &&
         message->info.cluster == ESP_ZB_ZCL_CLUSTER_ID_ON_OFF &&
         message->attribute.id == ESP_ZB_ZCL_ATTR_ON_OFF_ON_OFF_ID) {
         bool state = *(bool *)message->attribute.data.value;
-        gpio_driver_set_state(message->info.dst_endpoint, state);
+        send_command_to_wirenboard(message->info.dst_endpoint, state);
     }
     return ESP_OK;
 }
@@ -155,7 +234,6 @@ static void esp_zb_task(void *pvParameters)
         .manufacturer_name = ESP_MANUFACTURER_NAME,
         .model_identifier = ESP_MODEL_IDENTIFIER,
     };
-
 
     // Создаем и добавляем первый эндпоинт
     esp_zb_cluster_list_t *cluster_list1 = esp_zb_zcl_cluster_list_create();
@@ -194,7 +272,7 @@ static void esp_zb_task(void *pvParameters)
 
 void app_main(void)
 {
-    // Инициализация NVS
+    // Initialize NVS
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         ESP_ERROR_CHECK(nvs_flash_erase());
@@ -202,13 +280,19 @@ void app_main(void)
     }
     ESP_ERROR_CHECK(ret);
 
-    // Конфигурация платформы Zigbee
+    // Initialize UART
+    ESP_ERROR_CHECK(uart_driver_init());
+    
+    // Start UART event handler task
+    xTaskCreate(uart_event_task, "uart_task", 2048, NULL, 10, NULL);
+
+    // Zigbee platform config
     esp_zb_platform_config_t config = {
         .radio_config = ESP_ZB_DEFAULT_RADIO_CONFIG(),
         .host_config = ESP_ZB_DEFAULT_HOST_CONFIG(),
     };
     ESP_ERROR_CHECK(esp_zb_platform_config(&config));
 
-    // Запуск задачи Zigbee
+    // Start Zigbee task
     xTaskCreate(esp_zb_task, "Zigbee_main", 4096, NULL, 5, NULL);
 }
