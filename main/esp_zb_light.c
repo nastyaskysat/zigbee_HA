@@ -18,11 +18,13 @@ static const char *TAG = "ESP_ZB_USB_UART";
 #define ESP_MANUFACTURER_NAME "ESP_CUSTOM"
 #define ESP_MODEL_IDENTIFIER "ESP_LIGHT"
 
-// UART configuration for USB-to-UART
-#define UART_PORT_NUM      UART_NUM_0  // USB CDC port
+// UART конфигурации для передачи через реальные выводы
+#define UART_PORT_NUM      UART_NUM_0
 #define UART_BAUD_RATE     115200
 #define UART_BUF_SIZE      256
 #define UART_QUEUE_SIZE    20
+#define UART_TX_PIN        GPIO_NUM_16  // Выберите подходящие GPIO для вашей платы
+#define UART_RX_PIN        GPIO_NUM_17  // Выберите подходящие GPIO для вашей платы
 
 // Protocol definition
 #define CMD_PREFIX        "CMD:"
@@ -33,7 +35,7 @@ static const char *TAG = "ESP_ZB_USB_UART";
 // Global variables
 static QueueHandle_t uart_queue;
 
-// Function declarations
+// Заранее объявляю функции
 static esp_err_t uart_driver_init(void);
 static void send_command_to_wirenboard(uint8_t endpoint, bool state);
 static void uart_event_task(void *pvParameters);
@@ -42,7 +44,7 @@ static esp_err_t zb_attribute_handler(const esp_zb_zcl_set_attr_value_message_t 
 static esp_err_t zb_action_handler(esp_zb_core_action_callback_id_t callback_id, const void *message);
 static void esp_zb_task(void *pvParameters);
 
-// UART initialization
+// UART инициализация с реальными выводами
 static esp_err_t uart_driver_init(void)
 {
     uart_config_t uart_config = {
@@ -72,12 +74,20 @@ static esp_err_t uart_driver_init(void)
         return ret;
     }
     
-    // No need to set pins for USB-to-UART
-    ESP_LOGI(TAG, "USB-to-UART initialized");
+    // Устанавливаем пины для реального UART
+    ret = uart_set_pin(UART_PORT_NUM, UART_TX_PIN, UART_RX_PIN, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "UART pin config failed");
+        return ret;
+    }
+    
+    ESP_LOGI(TAG, "UART initialized with TX=%d, RX=%d", UART_TX_PIN, UART_RX_PIN);
     return ESP_OK;
 }
 
-// UART event handler task
+
+
+// UART обработчик событий
 static void uart_event_task(void *pvParameters)
 {
     uart_event_t event;
@@ -87,11 +97,11 @@ static void uart_event_task(void *pvParameters)
         if (xQueueReceive(uart_queue, (void *)&event, portMAX_DELAY)) {
             switch (event.type) {
                 case UART_DATA:
-                    // Read data from UART
+                    // Считываем с юарта
                     int len = uart_read_bytes(UART_PORT_NUM, rx_buf, event.size, portMAX_DELAY);
                     if (len > 0) {
-                        rx_buf[len] = '\0'; // Null-terminate
-                        ESP_LOGI(TAG, "Received from Wirenboard: %s", rx_buf);
+                        rx_buf[len] = '\0'; 
+                        //ESP_LOGI(TAG, "Received from Wirenboard: %s", rx_buf);
                     }
                     break;
                     
@@ -109,7 +119,7 @@ static void uart_event_task(void *pvParameters)
     vTaskDelete(NULL);
 }
 
-// Send command to Wirenboard
+
 static void send_command_to_wirenboard(uint8_t endpoint, bool state)
 {
     char command[32];
@@ -125,11 +135,11 @@ static void send_command_to_wirenboard(uint8_t endpoint, bool state)
     int len = strlen(command);
     int sent = uart_write_bytes(UART_PORT_NUM, command, len);
     
-    if (sent == len) {
-        ESP_LOGI(TAG, "Sent command to Wirenboard: %s", command);
-    } else {
-        ESP_LOGE(TAG, "Failed to send command to Wirenboard, sent %d/%d bytes", sent, len);
-    }
+    // if (sent == len) {
+    //     ESP_LOGI(TAG, "Sent command to Wirenboard: %s", command);
+    // } else {
+    //     ESP_LOGE(TAG, "Failed to send command to Wirenboard, sent %d/%d bytes", sent, len);
+    // }
 }
 
 // Callback для запуска комиссинга
@@ -195,6 +205,7 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
 // Обработчик атрибутов Zigbee
 static esp_err_t zb_attribute_handler(const esp_zb_zcl_set_attr_value_message_t *message)
 {
+    
     if ((message->info.dst_endpoint >= HA_ESP_LIGHT_ENDPOINT && 
          message->info.dst_endpoint <= HA_ESP_LIGHT_ENDPOINT + 1) &&
         message->info.cluster == ESP_ZB_ZCL_CLUSTER_ID_ON_OFF &&
@@ -212,12 +223,11 @@ static esp_err_t zb_action_handler(esp_zb_core_action_callback_id_t callback_id,
     case ESP_ZB_CORE_SET_ATTR_VALUE_CB_ID:
         return zb_attribute_handler((esp_zb_zcl_set_attr_value_message_t *)message);
     default:
-        ESP_LOGW(TAG, "Unhandled Zigbee action callback: 0x%x", callback_id);
+       // ESP_LOGW(TAG, "Unhandled Zigbee action callback: 0x%x", callback_id);
         return ESP_OK;
     }
 }
 
-// Главная задача Zigbee
 static void esp_zb_task(void *pvParameters)
 {
     // Инициализация стека Zigbee
@@ -227,41 +237,56 @@ static void esp_zb_task(void *pvParameters)
     // Создаем список эндпоинтов
     esp_zb_ep_list_t *ep_list = esp_zb_ep_list_create();
     
-    // Конфигурация кластера On/Off
-    esp_zb_on_off_light_cfg_t light_cfg = ESP_ZB_DEFAULT_ON_OFF_LIGHT_CONFIG();
-
-    zcl_basic_manufacturer_info_t info = {
-        .manufacturer_name = ESP_MANUFACTURER_NAME,
-        .model_identifier = ESP_MODEL_IDENTIFIER,
+    // Конфигурация кластера On/Off 
+    esp_zb_on_off_cluster_cfg_t on_off_cfg = {
+        .on_off = ESP_ZB_ZCL_ON_OFF_ON_OFF_DEFAULT_VALUE,
     };
 
-    // Создаем и добавляем первый эндпоинт
+    zcl_basic_manufacturer_info_t info = {
+        .manufacturer_name = "ESP_CUSTOM",
+        .model_identifier = "ESP_LIGHT",
+    };
+
+     // Первый эндпоинт
     esp_zb_cluster_list_t *cluster_list1 = esp_zb_zcl_cluster_list_create();
     esp_zb_cluster_list_add_basic_cluster(cluster_list1, esp_zb_basic_cluster_create(NULL), ESP_ZB_ZCL_CLUSTER_SERVER_ROLE);
-    esp_zb_cluster_list_add_on_off_cluster(cluster_list1, esp_zb_on_off_cluster_create(&light_cfg), ESP_ZB_ZCL_CLUSTER_SERVER_ROLE);
+    
+    esp_zb_attribute_list_t *on_off_attr_list1 = esp_zb_zcl_attr_list_create(ESP_ZB_ZCL_CLUSTER_ID_ON_OFF);
+    uint8_t attr_access = 0x02;
+    esp_zb_cluster_add_attr(on_off_attr_list1, ESP_ZB_ZCL_CLUSTER_ID_ON_OFF, 
+                           ESP_ZB_ZCL_ATTR_ON_OFF_ON_OFF_ID, 
+                           ESP_ZB_ZCL_ATTR_TYPE_BOOL, 
+                           ESP_ZB_ZCL_ATTR_ACCESS_WRITE_ONLY,  //явно прописываю write-only
+                           &(bool){false});
+    esp_zb_cluster_list_add_on_off_cluster(cluster_list1, on_off_attr_list1, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE);
+    
     esp_zb_ep_list_add_ep(ep_list, cluster_list1, 
                          (esp_zb_endpoint_config_t){
                              .endpoint = HA_ESP_LIGHT_ENDPOINT,
                              .app_profile_id = ESP_ZB_AF_HA_PROFILE_ID,
                              .app_device_id = ESP_ZB_HA_ON_OFF_LIGHT_DEVICE_ID
                          });
-    // Добавляем информацию о производителе для первого эндпоинта
-    esp_zcl_utility_add_ep_basic_manufacturer_info(ep_list, HA_ESP_LIGHT_ENDPOINT, &info);
 
-    // Создаем и добавляем второй эндпоинт
+    // Второй эндпоинт 
     esp_zb_cluster_list_t *cluster_list2 = esp_zb_zcl_cluster_list_create();
     esp_zb_cluster_list_add_basic_cluster(cluster_list2, esp_zb_basic_cluster_create(NULL), ESP_ZB_ZCL_CLUSTER_SERVER_ROLE);
-    esp_zb_cluster_list_add_on_off_cluster(cluster_list2, esp_zb_on_off_cluster_create(&light_cfg), ESP_ZB_ZCL_CLUSTER_SERVER_ROLE);
+    
+    esp_zb_attribute_list_t *on_off_attr_list2 = esp_zb_zcl_attr_list_create(ESP_ZB_ZCL_CLUSTER_ID_ON_OFF);
+    esp_zb_cluster_add_attr(on_off_attr_list2, ESP_ZB_ZCL_CLUSTER_ID_ON_OFF, 
+                           ESP_ZB_ZCL_ATTR_ON_OFF_ON_OFF_ID, 
+                           ESP_ZB_ZCL_ATTR_TYPE_BOOL, 
+                           ESP_ZB_ZCL_ATTR_ACCESS_WRITE_ONLY, //явно прописываю write-only
+                           &(bool){false});
+    esp_zb_cluster_list_add_on_off_cluster(cluster_list2, on_off_attr_list2, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE);
+    
     esp_zb_ep_list_add_ep(ep_list, cluster_list2, 
                          (esp_zb_endpoint_config_t){
                              .endpoint = HA_ESP_LIGHT_ENDPOINT + 1,
                              .app_profile_id = ESP_ZB_AF_HA_PROFILE_ID,
                              .app_device_id = ESP_ZB_HA_ON_OFF_OUTPUT_DEVICE_ID
                          });
-    // Добавляем информацию о производителе для второго эндпоинта
-    esp_zcl_utility_add_ep_basic_manufacturer_info(ep_list, HA_ESP_LIGHT_ENDPOINT + 1, &info);
 
-    // Регистрируем устройство
+    // Регистрация устройства
     esp_zb_device_register(ep_list);
     esp_zb_core_action_handler_register(zb_action_handler);
     esp_zb_set_primary_network_channel_set(ESP_ZB_PRIMARY_CHANNEL_MASK);
@@ -272,7 +297,7 @@ static void esp_zb_task(void *pvParameters)
 
 void app_main(void)
 {
-    // Initialize NVS
+    // Инициализация NVS
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         ESP_ERROR_CHECK(nvs_flash_erase());
@@ -280,19 +305,19 @@ void app_main(void)
     }
     ESP_ERROR_CHECK(ret);
 
-    // Initialize UART
+    // Инициализация UART
     ESP_ERROR_CHECK(uart_driver_init());
     
-    // Start UART event handler task
+    // Запуск юарта
     xTaskCreate(uart_event_task, "uart_task", 2048, NULL, 10, NULL);
 
-    // Zigbee platform config
+    // Zigbee конфигцрации
     esp_zb_platform_config_t config = {
         .radio_config = ESP_ZB_DEFAULT_RADIO_CONFIG(),
         .host_config = ESP_ZB_DEFAULT_HOST_CONFIG(),
     };
     ESP_ERROR_CHECK(esp_zb_platform_config(&config));
 
-    // Start Zigbee task
+    // Zigbee задача
     xTaskCreate(esp_zb_task, "Zigbee_main", 4096, NULL, 5, NULL);
 }
